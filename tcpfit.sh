@@ -712,11 +712,15 @@ calc_bdp(){ awk -v b="$1" -v r="$2" 'BEGIN{printf "%d", b*1000000/8*(r/1000)}'; 
 # tcp_mem(页). 内核在 pressure 阈值就开始缩窗, max 是硬顶.
 # 小内存机器上把 max 设成内存的一半是 OOM 主因 —— 这里固定按 1/8 与 1/4 推导.
 calc_tcp_mem(){
-  local ram_mb="$1"
-  awk -v m="$ram_mb" 'BEGIN{
-    pg=m*1024/4;                      # 总内存页数
+  local ram_mb="$1" page_size
+  page_size=$(getconf PAGESIZE) || return 1
+  # TCP 内存阈值以实际内核页为单位，兼容 16KB/64KB 页的机器。
+  awk -v m="$ram_mb" -v p="$page_size" 'BEGIN{
+    pg=m*1048576/p;                   # 总内存页数
     low=int(pg/16); pres=int(pg/8); max=int(pg/4);
-    if(low<4096) low=4096; if(pres<8192) pres=8192; if(max<16384) max=16384;
+    if(low<16777216/p) low=int(16777216/p);
+    if(pres<33554432/p) pres=int(33554432/p);
+    if(max<67108864/p) max=int(67108864/p);
     printf "%d %d %d", low, pres, max
   }'
 }
@@ -819,12 +823,14 @@ estimate_traffic_gb(){
 #   proxy 角色并发上百条连接 → 保守, 1MB
 #   bulk  角色只有少数大流   → 激进, 可到 BDP
 calc_buf_default(){
-  local role="$1" bdp="$2"
-  case "$role" in
+  local role="$1" bdp="$2" limit="${3:-8388608}" value
+  value=$(case "$role" in
     proxy) echo 1048576 ;;
     bulk)  awk -v b="$bdp" 'BEGIN{v=b; if(v<1048576)v=1048576; if(v>8388608)v=8388608; printf "%d", v}' ;;
     *)     echo 2097152 ;;
-  esac
+  esac)
+  # 默认值不能超过上限，否则 TCP 缓冲区三元组不再单调。
+  awk -v v="$value" -v cap="$limit" 'BEGIN{if(v>cap)v=cap; printf "%d\n",v}'
 }
 
 # 调优会动到的全部内核参数. 快照和回滚都以这份清单为准 ——
@@ -1721,7 +1727,7 @@ cmd_tune(){
   local bdp buf_max buf_def tcp_mem
   bdp=$(calc_bdp "$bw" "$rtt")
   buf_max=$(calc_buf_max "$bdp" "$ram")
-  buf_def=$(calc_buf_default "$role" "$bdp")
+  buf_def=$(calc_buf_default "$role" "$bdp" "$buf_max")
   tcp_mem=$(calc_tcp_mem "$ram")
 
   info "Derived from: ${bw} Mbps / RTT ${rtt} ms / ${ram} MB RAM / role $role"
